@@ -1,0 +1,105 @@
+#!/usr/bin/env ruby
+
+require 'rubygems'
+gem 'activerecord'
+gem 'activesupport'
+require 'active_record'
+require 'active_record/base'
+require 'active_support'
+
+require File.dirname(__FILE__) + '/composite_primary_keys/lib/composite_primary_keys'
+
+ActiveRecord::Base.logger = Logger.new("mysql_to_postgresql.log")
+
+TABLES_WITHOUT_SEQUENCES = ["schema_migrations"]
+TABLES_WITHOUT_UPDATED_AT = TABLES_WITHOUT_SEQUENCES + []
+
+PROCESSES = 8
+
+pids = []
+PROCESSES.times do |process_index|
+  pids << fork do
+    class MysqlModelBase < ActiveRecord::Base
+      establish_connection(
+        :adapter => "mysql",
+        :username => "username",
+        :password => "password",
+        :database => "database",
+        :encoding => "UTF8"
+      )
+    end
+
+    class PostgresqlModelBase < ActiveRecord::Base
+      establish_connection(
+        :adapter => "postgresql",
+        :username => "username",
+        :password => "password",
+        :database => "database",
+        :encoding => "UTF8"
+      )
+    end
+
+    MysqlModelBase.connection.tables.each_with_index do |table, table_index|
+      next unless table_index % PROCESSES == process_index
+      puts "[#{process_index}] Starting table: #{table}"
+      PostgresqlModelBase.transaction do
+        mysql_model_class = Class.new(MysqlModelBase) do
+          set_table_name table
+        end
+
+        id_column = case table
+                    when "schema_migrations"
+                      "version"
+                    else
+                      "id"
+                    end
+
+        postgresql_model_class = Class.new(PostgresqlModelBase) do
+          set_table_name table
+          set_primary_keys(id_column)
+        end
+
+        # Clear out tables without updated_at since we cannot easily figure out what has changed
+        # Remove updated rows for tables with primary keys (and updated_at columns)
+        if TABLES_WITHOUT_UPDATED_AT.include?(table)
+          puts "[#{process_index}] - #{table} - clearing out all rows"
+          postgresql_model_class.delete_all
+        else
+          last_updated_at = PostgresqlModelBase.connection.select_value("select max(updated_at) from #{table}")
+          updated_mysql_ids = MysqlModelBase.connection.select_values("select #{id_column} from #{table} where updated_at >= '#{last_updated_at}'")
+          if updated_mysql_ids.size > 0
+            puts "[#{process_index}] - #{table} - clearing out #{updated_mysql_ids.size} rows updated since last run"
+            PostgresqlModelBase.connection.execute("delete from #{table} where #{id_column} in (#{updated_mysql_ids.join(",")})")
+          end
+        end
+
+        mysql_ids = MysqlModelBase.connection.select_values("select #{id_column} from #{table}")
+        postgresql_ids = PostgresqlModelBase.connection.select_values("select #{id_column} from #{table}")
+
+        # Remove deleted rows
+        deleted_record_ids = postgresql_ids - mysql_ids
+        puts "[#{process_index}] - #{table} - clearing out #{deleted_record_ids.size} deleted rows"
+        unless TABLES_WITHOUT_UPDATED_AT.include?(table)
+          PostgresqlModelBase.connection.execute("delete from #{table} where #{id_column} in (#{deleted_record_ids.join(",")})") unless deleted_record_ids.empty?
+        end
+
+        # Add missing rows
+        new_record_ids = mysql_ids - postgresql_ids
+        puts "[#{process_index}] - #{table} - adding missing rows"
+        start, index = Time.now, 0
+        new_record_ids.in_groups_of(1000) do |ids|
+          puts "[#{process_index}] -- #{table} - #{index * 1000}/#{new_record_ids.size} #{Time.now - start} sec" if index % 10 == 0
+          index +=1
+          mysql_models = mysql_model_class.find(:all, :conditions => {id_column => ids})
+          mysql_models.each {|mysql_model| postgresql_model_class.create!(mysql_model.attributes) }
+        end
+
+        # Set sequence values
+        unless TABLES_WITHOUT_SEQUENCES.include?(table)
+          PostgresqlModelBase.connection.execute("select setval('#{table}_#{id_column}_seq', (select max(#{id_column}) from #{table}))")
+        end
+      end
+    end
+  end
+end
+pids.each { |pid| Process.waitpid(pid) }
